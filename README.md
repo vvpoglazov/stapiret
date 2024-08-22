@@ -1,0 +1,2 @@
+# stapiret
+Stackrox info parser
