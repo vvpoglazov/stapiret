@@ -20,7 +20,7 @@ API_TOKEN = os.getenv('STACKROX_API_TOKEN')
 PROXY_URL = os.getenv('PROXY_URL', 'http://localhost:8080')
 
 # Set the maximum number of concurrent API calls and retries
-MAX_CONCURRENT_REQUESTS = 20
+MAX_CONCURRENT_REQUESTS = 100
 MAX_RETRIES = 3
 RETRY_DELAY = 1
 
@@ -29,17 +29,21 @@ headers = {
     "Accept": "application/json"
 }
 
-async def make_request(session, url, semaphore, params=None):
+# Increase the timeout for the namespaces API call (e.g., 5 minutes)
+NAMESPACES_TIMEOUT = 300
+
+async def make_request(session, url, semaphore, params=None, timeout=None):
     async with semaphore:
         for attempt in range(MAX_RETRIES):
             try:
                 logger.info(f"Making request to: {url}")
-                async with session.get(url, headers=headers, params=params, ssl=False, proxy=PROXY_URL) as response:
+                timeout_obj = aiohttp.ClientTimeout(total=timeout) if timeout else None
+                async with session.get(url, headers=headers, params=params, ssl=False, proxy=PROXY_URL, timeout=timeout_obj) as response:
                     response.raise_for_status()
                     logger.info(f"Request to {url} successful. Status: {response.status}")
                     data = await response.json()
                     return data
-            except (aiohttp.ClientResponseError, aiohttp.ClientConnectorError, json.JSONDecodeError) as e:
+            except (aiohttp.ClientResponseError, aiohttp.ClientConnectorError, json.JSONDecodeError, asyncio.TimeoutError) as e:
                 logger.error(f"Attempt {attempt + 1} failed for URL {url}: {str(e)}")
                 if attempt == MAX_RETRIES - 1:
                     logger.error(f"All attempts failed for URL: {url}")
@@ -104,8 +108,8 @@ async def get_pods(session, semaphore):
 
 async def get_namespaces(session, semaphore):
     url = urllib.parse.urljoin(BASE_URL, '/v1/namespaces')
-    logger.info("Fetching namespaces")
-    namespaces = await make_request(session, url, semaphore)
+    logger.info("Fetching namespaces (this may take a while)")
+    namespaces = await make_request(session, url, semaphore, timeout=NAMESPACES_TIMEOUT)
     if namespaces and 'namespaces' in namespaces:
         namespaces = namespaces['namespaces']
     logger.info(f"Fetched {len(namespaces)} namespaces")
@@ -116,6 +120,28 @@ async def get_nodes(session, semaphore, cluster_id):
     logger.info(f"Fetching nodes for cluster {cluster_id}")
     nodes = await make_request(session, url, semaphore)
     return nodes
+
+async def get_images(session, semaphore):
+    url = urllib.parse.urljoin(BASE_URL, '/v1/images')
+    logger.info("Fetching images")
+    images = await get_paginated_data(session, url, semaphore, 'images')
+    logger.info(f"Fetched {len(images)} images")
+    return images
+
+async def search_by_image(session, semaphore, image_name):
+    url = urllib.parse.urljoin(BASE_URL, '/v1/search')
+    params = {
+        'query': f'Image:{image_name}',
+        'categories': ['DEPLOYMENTS', 'IMAGES']
+    }
+    logger.info(f"Searching for image: {image_name}")
+    search_results = await make_request(session, url, semaphore, params=params)
+    return image_name, search_results
+
+async def concurrent_image_search(session, semaphore, images):
+    search_tasks = [search_by_image(session, semaphore, image['name']) for image in images]
+    search_results = await asyncio.gather(*search_tasks)
+    return dict(search_results)
 
 async def main():
     if not all([BASE_URL, API_TOKEN]):
@@ -132,9 +158,10 @@ async def main():
         namespaces_task = get_namespaces(session, semaphore)
         deployments_task = get_deployments(session, semaphore)
         pods_task = get_pods(session, semaphore)
+        images_task = get_images(session, semaphore)
 
-        clusters, namespaces, deployments, pods = await asyncio.gather(
-            clusters_task, namespaces_task, deployments_task, pods_task
+        clusters, namespaces, deployments, pods, images = await asyncio.gather(
+            clusters_task, namespaces_task, deployments_task, pods_task, images_task
         )
 
         # Fetch nodes for each cluster
@@ -142,6 +169,14 @@ async def main():
         for cluster in clusters:
             cluster_id = cluster['id']
             nodes[cluster_id] = await get_nodes(session, semaphore, cluster_id)
+        
+        # Perform concurrent search for all images
+        logger.info("Starting concurrent image searches")
+        search_start_time = datetime.now()
+        search_results = await concurrent_image_search(session, semaphore, images)
+        search_end_time = datetime.now()
+        search_execution_time = search_end_time - search_start_time
+        logger.info(f"Concurrent image searches completed. Execution time: {search_execution_time}")
 
         # Save results to JSON files
         def save_to_json(data, filename, data_key):
@@ -153,11 +188,17 @@ async def main():
         save_to_json(namespaces, 'namespaces.json', 'namespaces')
         save_to_json(deployments, 'deployments.json', 'deployments')
         save_to_json(pods, 'pods.json', 'pods')
+        save_to_json(images, 'images.json', 'images')
 
         # Save nodes data
         with open('nodes.json', 'w') as f:
             json.dump(nodes, f, indent=2)
         logger.info("Saved nodes data to nodes.json")
+
+        # Save search results
+        with open('search_results.json', 'w') as f:
+            json.dump(search_results, f, indent=2)
+        logger.info("Saved search results to search_results.json")
 
         # Log summary
         logger.info(f"Total clusters: {len(clusters)}")
@@ -165,6 +206,8 @@ async def main():
         logger.info(f"Total namespaces: {len(namespaces)}")
         logger.info(f"Total deployments: {len(deployments)}")
         logger.info(f"Total pods: {len(pods)}")
+        logger.info(f"Total images: {len(images)}")
+        logger.info(f"Total image searches: {len(search_results)}")
 
 if __name__ == "__main__":
     logger.info("Script execution started")
